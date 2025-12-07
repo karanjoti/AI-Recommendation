@@ -8,6 +8,7 @@ const preferenceRoutes = require("./routes/preferenceRoutes");
 const eventRoutes = require("./routes/eventRoutes");
 const feedbackRoutes = require("./routes/feedbackRoutes");
 const importRoutes = require("./routes/importRoutes");
+const behaviorRoutes = require("./routes/behaviourRoutes");
 const { errorHandler, notFound } = require("./middleware/errorHandler");
 
 const app = express();
@@ -36,11 +37,8 @@ app.use("/api/preferences", preferenceRoutes);
 app.use("/api/events", eventRoutes);
 app.use("/api/feedback", feedbackRoutes);
 app.use("/api/import", importRoutes);
+app.use("/api/behavior", behaviorRoutes);
 
-app.get("/", (req, res) => {
-    console.log("Health check OK");
-  res.json({ status: "OK", message: "Event recommender backend running" });
-});
 
 // // Error handling
 app.use(notFound);
