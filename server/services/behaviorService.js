@@ -1,9 +1,6 @@
 // services/behaviorService.js
 const Event = require("../models/Event");
 
-// ---- SMALL HELPERS ----
-
-// safely increment a score in preferences
 function incrementPrefScore(prefs, field, key, delta) {
   if (!key) return;
   if (!prefs[field]) prefs[field] = {};
@@ -11,7 +8,6 @@ function incrementPrefScore(prefs, field, key, delta) {
   prefs[field][key] = current + delta;
 }
 
-// very simple keyword tokenizer
 function extractKeywords(q) {
   if (!q) return [];
   return q
@@ -20,15 +16,13 @@ function extractKeywords(q) {
     .filter((t) => t && t.length > 2);
 }
 
-// helper: smooth update for numeric preferences (e.g. budget)
 function smoothUpdate(current, incoming, alpha = 0.3) {
   if (incoming == null || isNaN(incoming)) return current;
   if (current == null || isNaN(current)) return incoming;
   return current * (1 - alpha) + incoming * alpha;
 }
 
-// ---- PRICE CLAMPING TO AVOID CRAZY VALUES ----
-const MAX_REASONABLE_PRICE = 100000; // e.g. 100k
+const MAX_REASONABLE_PRICE = 100000;
 const MIN_REASONABLE_PRICE = 0;
 
 function clampPrice(value) {
@@ -40,11 +34,41 @@ function clampPrice(value) {
   return num;
 }
 
+function normalizeCountryCode(input) {
+  const v = String(input || "").trim();
+  if (!v) return undefined;
+  const low = v.toLowerCase();
+  if (["world", "all", "global"].includes(low)) return undefined;
+  const iso2 = v.toUpperCase();
+  if (!/^[A-Z]{2}$/.test(iso2)) return undefined;
+  return iso2;
+}
+
+function normalizeCategory(input) {
+  const v = String(input || "").trim();
+  if (!v) return undefined;
+  if (["all", "All", "ALL"].includes(v)) return undefined;
+  return v;
+}
+
+// ✅ Unified preference updates
+function setPreferredCountry(prefs, iso2) {
+  if (!iso2) return;
+  // make live behaviour behave exactly like manual override
+  prefs.preferredCountry = iso2;
+}
+
+function setCategoriesFromSingle(prefs, category) {
+  if (!category) return;
+  // make live behaviour behave exactly like manual categories
+  // (manual is array; live gives a single category)
+  prefs.categories = [category];
+}
+
 const behaviorService = {
   async logSearch(user, { q, category, country, source, minPrice, maxPrice }) {
     const prefs = user.preferences || {};
 
-    // normalise + clamp
     const numericMin = clampPrice(
       typeof minPrice === "number" ? minPrice : minPrice != null ? Number(minPrice) : undefined
     );
@@ -52,113 +76,106 @@ const behaviorService = {
       typeof maxPrice === "number" ? maxPrice : maxPrice != null ? Number(maxPrice) : undefined
     );
 
-    // 1) raw interaction
     user.interactions.push({
       type: "search",
-      meta: {
-        q,
-        category,
-        country,
-        source,
-        minPrice: numericMin,
-        maxPrice: numericMax,
-      },
+      meta: { q, category, country, source, minPrice: numericMin, maxPrice: numericMax },
       createdAt: new Date(),
     });
 
-    // 2) aggregated scores
-    // search keywords (small weight)
+    // keyword learning
     const tokens = extractKeywords(q);
     tokens.forEach((t) => incrementPrefScore(prefs, "keywordScores", t, 0.3));
 
-    // selected category from search filter (medium weight)
-    if (category && category !== "All") {
-      incrementPrefScore(prefs, "categoryScores", category, 0.5);
+    // category learning + ✅ unify to manual field
+    const cat = normalizeCategory(category);
+    if (cat) {
+      incrementPrefScore(prefs, "categoryScores", cat, 0.5);
+      setCategoriesFromSingle(prefs, cat);
     }
 
-    // selected country (geo preference)
-    if (country && country !== "World") {
-      incrementPrefScore(prefs, "countryScores", country, 0.4);
+    // country learning + ✅ unify to manual field
+    const iso2 = normalizeCountryCode(country);
+    if (iso2) {
+      incrementPrefScore(prefs, "countryScores", iso2, 0.4);
+
+      // mild dampening so one old country doesn’t dominate forever
+      const map = prefs.countryScores || {};
+      for (const k of Object.keys(map)) {
+        if (k !== iso2) map[k] *= 0.97;
+      }
+      prefs.countryScores = map;
+
+      // ✅ make live behaviour behave like manual override
+      setPreferredCountry(prefs, iso2);
     }
 
-    // budget preference (smoothly learn user's typical range)
-    if (numericMin != null) {
-      prefs.priceMin = smoothUpdate(prefs.priceMin, numericMin);
-    }
-    if (numericMax != null) {
-      prefs.priceMax = smoothUpdate(prefs.priceMax, numericMax);
-    }
+    // price learning
+    if (numericMin != null) prefs.priceMin = smoothUpdate(prefs.priceMin, numericMin);
+    if (numericMax != null) prefs.priceMax = smoothUpdate(prefs.priceMax, numericMax);
 
     user.preferences = prefs;
     user.markModified("preferences");
     await user.save();
   },
 
-  /**
-   * payload: {
-   *   eventId?: string,        // internal Mongo _id
-   *   externalId?: string,     // tm_xxx / eb_xxx
-   *   source?: 'internal' | 'ticketmaster' | 'eventbrite',
-   *   title?: string,
-   *   url?: string,
-   *   category?: string,
-   *   country?: string
-   * }
-   */
   async logEventClick(user, payload) {
-    const { eventId, externalId, source, title, url, category, country } =
-      payload || {};
-
+    const { eventId, externalId, source, title, url, category, country } = payload || {};
     const prefs = user.preferences || {};
 
     let eventDoc = null;
-    if (eventId) {
-      eventDoc = await Event.findById(eventId).lean();
-    }
+    if (eventId) eventDoc = await Event.findById(eventId).lean();
 
-    const effectiveCategory = category || eventDoc?.category;
-    const effectiveCountry = country || eventDoc?.countryCode;
+    const effectiveCategory = normalizeCategory(category || eventDoc?.category);
 
-    // 1) raw interaction
-    const meta = {
-      source,
-      externalId,
-      title,
-      url,
-      category: effectiveCategory,
-      country: effectiveCountry,
-      provider: eventDoc?.provider,
-    };
+    // normalize click country (external events should send ISO2 countryCode)
+    const effectiveCountry =
+      normalizeCountryCode(country) || normalizeCountryCode(eventDoc?.countryCode);
 
     user.interactions.push({
       type: "click",
       event: eventDoc?._id || undefined,
-      meta,
+      meta: {
+        source,
+        externalId,
+        title,
+        url,
+        category: effectiveCategory,
+        country: effectiveCountry,
+        provider: eventDoc?.provider,
+      },
       createdAt: new Date(),
     });
 
-    // 2) preference updates
-    // strong signal that user cares about this category / country
+    // category learning + ✅ unify to manual field
     if (effectiveCategory) {
       incrementPrefScore(prefs, "categoryScores", effectiveCategory, 1.0);
+      setCategoriesFromSingle(prefs, effectiveCategory);
     }
 
+    // country learning + ✅ unify to manual field
     if (effectiveCountry) {
       incrementPrefScore(prefs, "countryScores", effectiveCountry, 0.7);
+
+      // mild dampening of others
+      const map = prefs.countryScores || {};
+      for (const k of Object.keys(map)) {
+        if (k !== effectiveCountry) map[k] *= 0.98;
+      }
+      prefs.countryScores = map;
+
+      // ✅ make live behaviour behave like manual override
+      setPreferredCountry(prefs, effectiveCountry);
     }
 
-    // optional: learn keywords from title
+    // title keywords
     if (title) {
-      extractKeywords(title).forEach((t) =>
-        incrementPrefScore(prefs, "keywordScores", t, 0.5)
-      );
+      extractKeywords(title).forEach((t) => incrementPrefScore(prefs, "keywordScores", t, 0.5));
     }
 
     user.preferences = prefs;
     user.markModified("preferences");
     await user.save();
   },
-
 
   async logRating(user, event, rating) {
     const prefs = user.preferences || {};
@@ -170,15 +187,14 @@ const behaviorService = {
       createdAt: new Date(),
     });
 
-    // positive ratings → boost category & keywords harder
-    const weight =
-      rating >= 4 ? 1.5 : rating >= 3 ? 0.5 : rating <= 2 ? -0.5 : 0;
+    const weight = rating >= 4 ? 1.5 : rating >= 3 ? 0.5 : rating <= 2 ? -0.5 : 0;
 
     if (event.category) {
       incrementPrefScore(prefs, "categoryScores", event.category, weight);
+      // ✅ unify categories too (rating is a strong preference signal)
+      if (weight > 0) setCategoriesFromSingle(prefs, event.category);
     }
 
-    // optional: use title tokens as keywords
     if (event.title) {
       extractKeywords(event.title).forEach((t) =>
         incrementPrefScore(prefs, "keywordScores", t, weight * 0.3)
